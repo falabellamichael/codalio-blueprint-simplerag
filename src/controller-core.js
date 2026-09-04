@@ -110,8 +110,8 @@
 
         // Agent -> Model
         temperature: 0.3,
-        lensMaxOutputTokens: 4096,
-        documentMaxOutputTokens: 8192,
+        lensMaxOutputTokens: 8192,
+        documentMaxOutputTokens: 16384,
         maxPromptChars: 2400,
         confirmStop: false,
 
@@ -384,7 +384,7 @@
 
     function writeStore(store) {
         try {
-            window.localStorage.setItem(PROJECTS_KEY, JSON.stringify({
+            const payload = {
                 version: 2,
                 folders: store.folders,
                 files: store.files,
@@ -392,7 +392,16 @@
                 openPath: store.openPath,
                 activeRunId: store.activeRunId,
                 activeFolderId: store.activeFolderId
-            }, withoutDomNodes));
+            };
+            let serialized;
+            try {
+                // Fast path: native C++ serialization without invoking replacer across 50k properties
+                serialized = JSON.stringify(payload);
+            } catch (_) {
+                // Safe fallback: filter DOM nodes and circular structures
+                serialized = JSON.stringify(payload, withoutDomNodes);
+            }
+            window.localStorage.setItem(PROJECTS_KEY, serialized);
             persistence.ok = true;
             persistence.lastError = '';
             return true;
@@ -502,7 +511,8 @@
         // User project files (origin === 'imported') are protected from in-place rewrites.
         if (previous && previous.origin === 'imported') {
             const isImportAction = Boolean(meta && meta.origin === 'imported');
-            if (!isImportAction) {
+            const isUserEdit = Boolean(meta && meta.userEdit === true);
+            if (!isImportAction && !isUserEdit) {
                 console.warn(`[codalio-blueprint] protected user source file: ${cleanPath}. Writing revision to docs/ instead.`);
                 const safePath = cleanPath.startsWith('docs/') ? cleanPath : `docs/${cleanPath}.revised.md`;
                 return writeFile(safePath, content, Object.assign({}, meta, { origin: 'blueprint', createdBy: 'blueprint' }));
@@ -906,13 +916,43 @@
         return findRun(store.activeRunId);
     }
 
+    function sanitizeRunForStorage(run) {
+        if (!run || typeof run !== 'object') return run;
+        const list = Array.isArray(run.phases) ? run.phases : (Array.isArray(run.steps) ? run.steps : null);
+        if (!list) return run;
+        let hasDom = false;
+        for (const item of list) {
+            if (item && (item.liveElement || item.liveThinkingElement || item._renderedMarkdown || item._domNode)) {
+                hasDom = true;
+                break;
+            }
+        }
+        if (!hasDom) return run;
+        const copy = Object.assign({}, run);
+        const cleaned = list.map(p => {
+            if (p && (p.liveElement || p.liveThinkingElement || p._renderedMarkdown || p._domNode)) {
+                const pCopy = Object.assign({}, p);
+                delete pCopy.liveElement;
+                delete pCopy.liveThinkingElement;
+                delete pCopy._renderedMarkdown;
+                delete pCopy._domNode;
+                return pCopy;
+            }
+            return p;
+        });
+        if (Array.isArray(run.phases)) copy.phases = cleaned;
+        if (Array.isArray(run.steps)) copy.steps = cleaned;
+        return copy;
+    }
+
     /** Returns false when the in-memory change could not be persisted. */
     function saveRun(run) {
-        const index = store.runs.findIndex(item => item && item.id === run.id);
-        if (index >= 0) store.runs[index] = run;
-        else store.runs.unshift(run);
+        const cleaned = sanitizeRunForStorage(run);
+        const index = store.runs.findIndex(item => item && item.id === cleaned.id);
+        if (index >= 0) store.runs[index] = cleaned;
+        else store.runs.unshift(cleaned);
         store.runs = store.runs.slice(0, 60);
-        store.activeRunId = run.id;
+        store.activeRunId = cleaned.id;
         return writeStore(store);
     }
 
@@ -953,6 +993,56 @@
     }
 
     /**
+     * Determines whether an error returned by a model endpoint or stream indicates
+     * that the context window / token limit was exceeded ("ran out of context").
+     */
+    function isContextOverflowError(error) {
+        if (!error) return false;
+        const msg = String(
+            (error && (error.message || error.detail || error.error || error.code || error.statusText)) || error || ''
+        ).toLowerCase();
+        return (
+            msg.includes('context length') ||
+            msg.includes('context window') ||
+            msg.includes('context overflow') ||
+            msg.includes('context_length_exceeded') ||
+            msg.includes('maximum context') ||
+            msg.includes('max context') ||
+            msg.includes('max_tokens') ||
+            msg.includes('n_ctx') ||
+            msg.includes('prompt is too long') ||
+            msg.includes('prompt too long') ||
+            msg.includes('too many tokens') ||
+            msg.includes('token limit') ||
+            msg.includes('token budget exceeded') ||
+            msg.includes('exceeds token') ||
+            msg.includes('exceeds maximum') ||
+            msg.includes('out of memory') ||
+            msg.includes('out of context') ||
+            (msg.includes('400') && (msg.includes('token') || msg.includes('context') || msg.includes('length')))
+        );
+    }
+
+    /**
+     * Determines whether the response text contains an output limit warning notice
+     * emitted by SimpleRAG or upstream providers.
+     */
+    function hasOutputLimitNotice(text) {
+        return /(?:Context window|Output|Response length) limit reached/i.test(String(text || ''));
+    }
+
+    /**
+     * Strips synthetic length-limit and context-window notices injected by the server
+     * so that the agent and downstream steps work with pristine model content.
+     */
+    function stripOutputLimitNotice(text) {
+        return String(text || '')
+            .replace(/\[⚠️\s*(?:Context window|Output|Response length) limit reached[^\]]*\]/gi, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    }
+
+    /**
      * Anti-gravity Context Compactor (Deterministic Engine)
      *
      * Constructs a high-density, structured compaction summary adhering strictly
@@ -977,10 +1067,18 @@
         const userRequests = [];
         messages.forEach(msg => {
             if (!msg) return;
+            if (msg.compaction && Array.isArray(msg.compaction.userRequests)) {
+                msg.compaction.userRequests.forEach(req => {
+                    if (req && typeof req === 'string') {
+                        const trimmed = req.trim();
+                        if (trimmed && !userRequests.includes(trimmed)) userRequests.push(trimmed);
+                    }
+                });
+            }
             if (msg.role === 'user' && typeof msg.text === 'string') {
                 const trimmed = msg.text.trim();
                 if (trimmed && !trimmed.startsWith('/clear') && !trimmed.startsWith('/compact')) {
-                    userRequests.push(trimmed);
+                    if (!userRequests.includes(trimmed)) userRequests.push(trimmed);
                 }
             }
         });
@@ -1262,10 +1360,20 @@
         return index;
     }
 
+    const markdownCache = new Map();
+    const MAX_MARKDOWN_CACHE = 100;
+
     function renderMarkdown(source) {
+        const text = String(source || '');
+        if (markdownCache.has(text)) {
+            const cached = markdownCache.get(text);
+            if (cached && typeof cached.cloneNode === 'function') {
+                return cached.cloneNode(true);
+            }
+        }
         const root = document.createElement('div');
         root.className = 'cb-markdown';
-        const lines = String(source || '').replace(/\r\n?/g, '\n').split('\n');
+        const lines = text.replace(/\r\n?/g, '\n').split('\n');
         let index = 0;
         while (index < lines.length) {
             const line = lines[index];
@@ -1274,9 +1382,10 @@
             const fence = /^\s*(```|~~~)\s*([A-Za-z0-9_+-]*)\s*$/.exec(line);
             if (fence) {
                 const closing = fence[1];
+                const closingRegex = new RegExp(`^\\s*${closing}\\s*$`);
                 const body = [];
                 index += 1;
-                while (index < lines.length && !new RegExp(`^\\s*${closing}\\s*$`).test(lines[index])) {
+                while (index < lines.length && !closingRegex.test(lines[index])) {
                     body.push(lines[index]);
                     index += 1;
                 }
@@ -1357,6 +1466,13 @@
             } else {
                 index += 1;
             }
+        }
+        if (text.length < 250000 && typeof root.cloneNode === 'function') {
+            if (markdownCache.size >= MAX_MARKDOWN_CACHE) {
+                const oldest = markdownCache.keys().next().value;
+                markdownCache.delete(oldest);
+            }
+            markdownCache.set(text, root.cloneNode(true));
         }
         return root;
     }
@@ -1486,8 +1602,9 @@
         if (NO_ENDPOINT_PATTERN.test(text)) {
             throw new BlueprintModelError(text);
         }
-        if (finishReason === 'length' && text.toLowerCase().includes(tokenLimitNotice)) {
-            throw new BlueprintModelError(`The model hit its ${tokenLimitNotice}. Raise the token budget in Blueprint settings and retry.`);
+        if (hasOutputLimitNotice(text)) {
+            finishReason = finishReason || 'length';
+            text = stripOutputLimitNotice(text);
         }
         return { text, thinking, finishReason, usage, cancelId };
     }
@@ -1858,6 +1975,9 @@
         deleteRun,
         createRun,
         estimateTokens,
+        isContextOverflowError,
+        hasOutputLimitNotice,
+        stripOutputLimitNotice,
         buildDeterministicCompaction,
         renderMarkdown,
         appendInline,

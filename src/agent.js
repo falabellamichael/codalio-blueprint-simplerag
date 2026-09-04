@@ -61,6 +61,7 @@
         step.substatus = '';
         step.streaming = false;
         step.liveElement = null;
+        step.liveThinkingElement = null;
         return step;
     }
 
@@ -75,18 +76,98 @@
         return `${base}\n\n## Additional standing instructions from the user\n${guidance}`;
     }
 
+    function stripContinuationPreamble(text) {
+        return String(text || '').replace(
+            /^(?:Here is the continuation(?:\s+of the response)?|Continuing from where (?:I|we) left off|Continuing(?: generation)?|As requested, continuing)\s*[:—–-]?\s*/i,
+            ''
+        );
+    }
+
+    function stitchContinuationText(prior, chunk) {
+        const p = String(prior || '');
+        let c = stripContinuationPreamble(String(chunk || ''));
+        if (!c) return p;
+        if (!p) return c;
+
+        const maxOverlap = Math.min(200, p.length, c.length);
+        for (let len = maxOverlap; len >= 6; len--) {
+            const pTail = p.slice(-len);
+            const cHead = c.slice(0, len);
+            if (pTail.toLowerCase() === cHead.toLowerCase()) {
+                c = c.slice(len);
+                break;
+            }
+        }
+
+        const pEndsWithSpace = /\s$/.test(p);
+        const cStartsWithSpace = /^\s/.test(c);
+        if (pEndsWithSpace || cStartsWithSpace) {
+            return p + c;
+        }
+
+        if (/[.!?:;)\n]$/.test(p)) {
+            return p + ' ' + c;
+        }
+
+        if (/^[A-Z]/.test(c) && /[a-z0-9]$/.test(p)) {
+            return p + ' ' + c;
+        }
+
+        return p + c;
+    }
+
+    function buildContinuationPrompt(originalPrompt, accumulatedText) {
+        const cleanText = (core && typeof core.stripOutputLimitNotice === 'function')
+            ? core.stripOutputLimitNotice(accumulatedText)
+            : String(accumulatedText || '').replace(/\[⚠️\s*(?:Context window|Output|Response length) limit reached[^\]]*\]/gi, '').trim();
+        
+        const tailLength = 1200;
+        const tail = cleanText.length > tailLength ? cleanText.slice(-tailLength) : cleanText;
+        
+        const headings = (cleanText.match(/^#{1,4}\s+.+$/gm) || [])
+            .map(h => h.trim())
+            .slice(-5);
+        const headingsContext = headings.length > 0
+            ? ['Sections started/completed so far:', ...headings.map(h => `- ${h}`), ''].join('\n')
+            : '';
+
+        return [
+            originalPrompt,
+            '',
+            '---',
+            '# CONTINUATION REQUIRED (OUTPUT LIMIT REACHED)',
+            'Your previous response reached the output token limit and was cut off before completing all sections.',
+            headingsContext,
+            'Here is the tail of the text you generated so far:',
+            '```markdown',
+            tail,
+            '```',
+            '',
+            'TASK: Continue generating seamlessly from the exact character/point where the text above ended.',
+            'CRITICAL RULES:',
+            '1. Do NOT restart from the beginning.',
+            '2. Do NOT repeat sections or paragraphs that were already generated above.',
+            '3. Produce all remaining sections until the entire output contract is completely fulfilled.',
+            '4. Return only the continuation text.'
+        ].join('\n');
+    }
+
     /**
      * Run one model turn as a visible step. The step streams into its own live
      * DOM node so the user watches tokens arrive, exactly like an agent trace.
      */
     async function runModelStep(step, options, hooks) {
         const settings = options.settings || core.readSettings();
-        step.startedAt = Date.now();
-        step.elapsedMs = 0;
         step.status = 'running';
-        step.substatus = options.substatus || 'Connecting to model endpoint…';
-        step.promptPreview = promptPreview(options.prompt, settings.maxPromptChars);
         step.streaming = true;
+        step.startedAt = Date.now();
+        step.promptPreview = promptPreview(options.prompt, settings.maxPromptChars);
+        step.substatus = options.substatus || 'Waiting for the model…';
+        step.error = '';
+        step.text = '';
+        step.thinking = '';
+        step.finishReason = '';
+
         if (settings.expandRunningSteps !== false) {
             step.open = true;
         }
@@ -118,14 +199,14 @@
                 step.tokenCount = Math.round(totalChars / 3.8);
                 step.tokensPerSec = Math.round(step.tokenCount / elapsedSec);
             }
-            if (isThinking && step.liveThinkingElement) {
+            if (now - lastRender < 80) return;
+            lastRender = now;
+            if (step.liveThinkingElement && thinkingCode) {
                 thinkingCode.textContent = thinking;
                 if (liveThinking.scrollHeight - liveThinking.scrollTop - liveThinking.clientHeight < 60) {
                     liveThinking.scrollTop = liveThinking.scrollHeight;
                 }
             }
-            if (now - lastRender < 80) return;
-            lastRender = now;
             code.textContent = text;
             if (hooks && typeof hooks.onStream === 'function') hooks.onStream(step, text);
         };
@@ -133,7 +214,7 @@
         if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
 
         try {
-            const result = await core.streamModelTurn({
+            let result = await core.streamModelTurn({
                 systemPrompt: options.systemPrompt,
                 message: options.prompt,
                 maxOutputTokens: options.maxOutputTokens,
@@ -152,11 +233,76 @@
                     scheduleRender(rendered, true);
                 }
             });
+
+            let accumulatedText = (core && typeof core.stripOutputLimitNotice === 'function')
+                ? core.stripOutputLimitNotice(result.text || rendered)
+                : String(result.text || rendered || '').replace(/\[⚠️\s*(?:Context window|Output|Response length) limit reached[^\]]*\]/gi, '').trim();
+            let accumulatedThinking = result.thinking || thinking;
+            let finishReason = result.finishReason || '';
+            let totalUsage = result.usage ? { ...result.usage } : null;
+            let continuationPass = 0;
+            const MAX_CONTINUATION_PASSES = 4;
+
+            const checkLimitReached = (resText, reason) => {
+                if (reason === 'length') return true;
+                if (core && typeof core.hasOutputLimitNotice === 'function') {
+                    return core.hasOutputLimitNotice(resText);
+                }
+                return /(?:Context window|Output|Response length) limit reached/i.test(String(resText || ''));
+            };
+
+            while (checkLimitReached(result.text || rendered, finishReason) && continuationPass < MAX_CONTINUATION_PASSES) {
+                if (options.signal && options.signal.aborted) break;
+                continuationPass++;
+                step.substatus = `⚡ Output limit reached — automatically continuing generation (part ${continuationPass + 1})…`;
+                scheduleRender(accumulatedText, false);
+                if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
+
+                const contPrompt = buildContinuationPrompt(options.prompt, accumulatedText);
+                let contRendered = '';
+
+                const contResult = await core.streamModelTurn({
+                    systemPrompt: options.systemPrompt,
+                    message: contPrompt,
+                    maxOutputTokens: options.maxOutputTokens,
+                    temperature: options.temperature,
+                    signal: options.signal,
+                    cancelId: options.cancelId,
+                    onDelta: (_delta, fullContText) => {
+                        contRendered = fullContText;
+                        const stitchedLive = stitchContinuationText(accumulatedText, fullContText);
+                        scheduleRender(stitchedLive, false);
+                    },
+                    onThinking: (_delta, fullContThinking) => {
+                        const stitchedLive = stitchContinuationText(accumulatedText, contRendered);
+                        scheduleRender(stitchedLive, true);
+                    }
+                });
+
+                const cleanChunk = (core && typeof core.stripOutputLimitNotice === 'function')
+                    ? core.stripOutputLimitNotice(contResult.text || contRendered)
+                    : String(contResult.text || contRendered || '').replace(/\[⚠️\s*(?:Context window|Output|Response length) limit reached[^\]]*\]/gi, '').trim();
+                accumulatedText = stitchContinuationText(accumulatedText, cleanChunk);
+                finishReason = contResult.finishReason || '';
+                result = contResult;
+                rendered = contRendered;
+
+                if (contResult.usage && totalUsage) {
+                    totalUsage.prompt_tokens = (totalUsage.prompt_tokens || 0) + (contResult.usage.prompt_tokens || 0);
+                    totalUsage.completion_tokens = (totalUsage.completion_tokens || 0) + (contResult.usage.completion_tokens || 0);
+                    totalUsage.total_tokens = (totalUsage.total_tokens || 0) + (contResult.usage.total_tokens || 0);
+                }
+            }
+
+            if (continuationPass > 0 && !checkLimitReached(result.text || rendered, finishReason)) {
+                finishReason = 'stop';
+            }
+
             step.cancelId = result.cancelId || '';
-            step.text = bounded(result.text || rendered);
-            step.thinking = bounded(result.thinking || thinking);
-            step.finishReason = result.finishReason || '';
-            if (result.usage) step.usage = result.usage;
+            step.text = bounded(accumulatedText);
+            step.thinking = bounded(accumulatedThinking);
+            step.finishReason = finishReason;
+            if (totalUsage) step.usage = totalUsage;
             finishStep(step, 'done');
             step.open = true;
             return step;
@@ -168,6 +314,37 @@
                 step.error = 'Stopped by the user.';
                 throw error;
             }
+
+            // Auto-compaction recovery: when context runs out, compact automatically and retry the turn
+            const isOverflow = (core && typeof core.isContextOverflowError === 'function')
+                ? core.isContextOverflowError(error)
+                : String(error && (error.message || error)).toLowerCase().includes('context');
+
+            if (isOverflow && !options._retriedWithCompaction) {
+                if (hooks && typeof hooks.onAutoCompact === 'function') {
+                    step.substatus = '⚡ Context limit reached — auto-compacting and retrying…';
+                    step.error = '';
+                    try {
+                        const newCompaction = await hooks.onAutoCompact({
+                            error,
+                            step,
+                            options,
+                            reason: 'context-overflow'
+                        });
+                        if (newCompaction) {
+                            options._retriedWithCompaction = true;
+                            options.prompt = injectCompactionIntoPrompt(options.prompt, newCompaction);
+                            step.promptPreview = promptPreview(options.prompt, settings.maxPromptChars);
+                            step.text = '';
+                            step.thinking = '';
+                            return await runModelStep(step, options, hooks);
+                        }
+                    } catch (compactError) {
+                        console.warn('[Blueprint] Auto-compaction recovery failed:', compactError);
+                    }
+                }
+            }
+
             finishStep(step, 'error');
             step.error = String((error && error.message) || 'The model step failed.');
             step.text = bounded(rendered);
@@ -180,6 +357,18 @@
     // Anti-gravity Context Compression Protocol
     // ------------------------------------------------------------------
 
+    function stripCompactionFromPrompt(prompt) {
+        const text = String(prompt || '');
+        const marker = '# Resuming from a compaction';
+        if (!text.startsWith(marker)) return text;
+        const separator = '\n\n---\n\n';
+        const sepIndex = text.indexOf(separator);
+        if (sepIndex !== -1) {
+            return text.slice(sepIndex + separator.length).trimStart();
+        }
+        return text;
+    }
+
     function formatCompactionPrompt(compaction) {
         if (!compaction || !compaction.rawText) return '';
         return String(compaction.rawText).trim();
@@ -189,7 +378,8 @@
         if (!compaction || !compaction.rawText) return prompt;
         const formatted = formatCompactionPrompt(compaction);
         if (!formatted) return prompt;
-        return `${formatted}\n\n---\n\n${prompt}`;
+        const cleanPrompt = stripCompactionFromPrompt(prompt);
+        return `${formatted}\n\n---\n\n${cleanPrompt}`;
     }
 
     /**
@@ -324,26 +514,6 @@
         const cfg = settings || core.readSettings();
         if (cfg.includeSourceInPrompts === false) return [];
 
-        let attached = Array.isArray(projectState.sourceFiles) ? projectState.sourceFiles.filter(Boolean) : [];
-
-        // Standalone Direct Project Access:
-        // If no files were manually attached in the editor, automatically access the project
-        // files from the active project folder!
-        if (!attached.length && core && typeof core.listFiles === 'function') {
-            const activeFolderId = projectState.activeFolderId || (core.store && core.store.activeFolderId);
-            const folderFiles = core.listFiles(activeFolderId);
-            const targetFiles = folderFiles.length ? folderFiles : core.listFiles();
-
-            // Filter out generated docs, prioritize source code and project configs
-            const sourcePaths = targetFiles.filter(p => !p.startsWith('docs/'));
-            const finalPaths = sourcePaths.length ? sourcePaths : targetFiles;
-
-            attached = finalPaths.map(p => {
-                const rec = core.readFile(p);
-                return rec ? { path: rec.path, content: rec.content } : null;
-            }).filter(Boolean);
-        }
-
         const maxFiles = Number(cfg.maxSourceFiles) || 50;
         const maxFileBytes = (Number(cfg.maxSourceFileKb) || 500) * 1024;
         const maxTotalBytes = (Number(cfg.maxSourceTotalKb) || 2048) * 1024;
@@ -352,27 +522,77 @@
         const selected = [];
         const rejected = [];
 
-        for (const file of attached) {
-            if (!file || typeof file.content !== 'string') continue;
-            if (selected.length >= maxFiles) {
-                rejected.push({ path: file.path, reason: 'over the maximum file count' });
-                continue;
+        const mode = projectState.sourceFileMode || '';
+        const attached = Array.isArray(projectState.sourceFiles) ? projectState.sourceFiles.filter(Boolean) : [];
+
+        // 1. Process user-selected / attached files first
+        if (attached.length) {
+            for (const file of attached) {
+                if (!file || typeof file.content !== 'string') continue;
+                if (selected.length >= maxFiles) {
+                    rejected.push({ path: file.path, reason: 'over the maximum file count' });
+                    continue;
+                }
+                const bytes = file.content.length;
+                if (bytes > maxFileBytes) {
+                    rejected.push({ path: file.path, reason: `larger than ${Math.round(maxFileBytes / 1024)} KB` });
+                    continue;
+                }
+                if (total + bytes > maxTotalBytes) {
+                    rejected.push({ path: file.path, reason: 'would exceed the total size budget' });
+                    continue;
+                }
+                total += bytes;
+                selected.push({
+                    path: file.path,
+                    content: file.content,
+                    lines: file.content.split('\n').length
+                });
             }
-            const bytes = file.content.length;
-            if (bytes > maxFileBytes) {
-                rejected.push({ path: file.path, reason: `larger than ${Math.round(maxFileBytes / 1024)} KB` });
-                continue;
+        }
+
+        // 2. Auto-discovery from project workspace to fill budget:
+        // - In 'combine' mode: augments manually attached files with auto-discovered workspace files.
+        // - In 'exclusive' mode: strictly limited to attached files only.
+        // - When unspecified: auto-discovers only when no files were manually attached (backward-compat).
+        const shouldDiscover = mode === 'combine' || (!mode && !attached.length);
+        if (shouldDiscover && core && typeof core.listFiles === 'function') {
+            // Standalone Direct Project Access:
+            // Lazily inspect files directly, stopping as soon as budget is filled.
+            const activeFolderId = projectState.activeFolderId || (core.store && core.store.activeFolderId);
+            const folderFiles = core.listFiles(activeFolderId);
+            const targetFiles = folderFiles.length ? folderFiles : core.listFiles();
+
+            // Filter out generated docs, prioritize source code and project configs
+            const sourcePaths = targetFiles.filter(p => !p.startsWith('docs/'));
+            const finalPaths = sourcePaths.length ? sourcePaths : targetFiles;
+
+            for (const path of finalPaths) {
+                // Skip if already attached by the user
+                if (selected.some(item => item.path === path)) continue;
+
+                if (selected.length >= maxFiles) {
+                    rejected.push({ path, reason: 'over the maximum file count' });
+                    break; // stop reading any more files from storage!
+                }
+                const rec = core.readFile(path);
+                if (!rec || typeof rec.content !== 'string') continue;
+                const bytes = rec.content.length;
+                if (bytes > maxFileBytes) {
+                    rejected.push({ path, reason: `larger than ${Math.round(maxFileBytes / 1024)} KB` });
+                    continue;
+                }
+                if (total + bytes > maxTotalBytes) {
+                    rejected.push({ path, reason: 'would exceed the total size budget' });
+                    break; // stop reading once size budget is hit!
+                }
+                total += bytes;
+                selected.push({
+                    path: rec.path,
+                    content: rec.content,
+                    lines: rec.content.split('\n').length
+                });
             }
-            if (total + bytes > maxTotalBytes) {
-                rejected.push({ path: file.path, reason: 'would exceed the total size budget' });
-                continue;
-            }
-            total += bytes;
-            selected.push({
-                path: file.path,
-                content: file.content,
-                lines: file.content.split('\n').length
-            });
         }
 
         selected.rejected = rejected;
@@ -578,10 +798,16 @@
 
         const emit = step => {
             run.phases.push(step);
-            if (hooks && typeof hooks.onStep === 'function') hooks.onStep(step);
+            if (hooks && typeof hooks.onStep === 'function') {
+                try { hooks.onStep(step); } catch (err) { console.warn('[Blueprint] onStep hook error:', err); }
+            }
             core.saveRun(run);
         };
-        const render = () => { if (hooks && typeof hooks.onRender === 'function') hooks.onRender(); };
+        const render = () => {
+            if (hooks && typeof hooks.onRender === 'function') {
+                try { hooks.onRender(); } catch (err) { console.warn('[Blueprint] onRender hook error:', err); }
+            }
+        };
 
         // ---- Announce ------------------------------------------------
         // Settings -> Agent -> Planning -> "Announce the chosen skill".
@@ -694,6 +920,25 @@
             }
         }
 
+        const handleAutoCompact = async (event) => {
+            if (hooks && typeof hooks.onAutoCompact === 'function') {
+                const updated = await hooks.onAutoCompact(event);
+                if (updated) {
+                    compaction = updated;
+                    input.compaction = updated;
+                    return updated;
+                }
+            }
+            const fallback = core.buildDeterministicCompaction({
+                messages: input.messages || [],
+                run,
+                settings
+            });
+            compaction = fallback;
+            input.compaction = fallback;
+            return fallback;
+        };
+
         // ---- Lenses (multi-lens skills) -----------------------------
         const lensOutputs = {};
         if (skill.multiLens && Array.isArray(skill.lenses) && skill.lenses.length) {
@@ -740,7 +985,11 @@
                     maxOutputTokens: settings.lensMaxOutputTokens,
                     temperature: settings.temperature,
                     signal: input.signal
-                }, { onRender: render, onStream: () => render() });
+                }, {
+                    onRender: render,
+                    onStream: (s, t) => { if (hooks && typeof hooks.onStream === 'function') hooks.onStream(s, t); },
+                    onAutoCompact: handleAutoCompact
+                });
                 lensOutputs[lens.id] = step.text;
                 core.saveRun(run);
             };
@@ -785,6 +1034,8 @@
             }
 
             const isDoc = phase.kind === 'document';
+            const isLargeStep = isDoc || phase.kind === 'analysis' || Boolean(phase.requiresSource || skill.requiresSource);
+            const phaseTokenBudget = isLargeStep ? settings.documentMaxOutputTokens : settings.lensMaxOutputTokens;
             const step = makeStep({
                 kind: isDoc ? 'document' : 'phase',
                 label: phase.label,
@@ -812,10 +1063,14 @@
                     'You are a product planning analyst. Follow the output contract exactly. Return only the requested Markdown, with no preamble.',
                     settings
                 ),
-                maxOutputTokens: isDoc ? settings.documentMaxOutputTokens : settings.lensMaxOutputTokens,
+                maxOutputTokens: phaseTokenBudget,
                 temperature: settings.temperature,
                 signal: input.signal
-            }, { onRender: render, onStream: () => render() });
+            }, {
+                onRender: render,
+                onStream: (s, t) => { if (hooks && typeof hooks.onStream === 'function') hooks.onStream(s, t); },
+                onAutoCompact: handleAutoCompact
+            });
 
             phaseOutputs[phase.id] = step.text;
 
@@ -979,9 +1234,13 @@
             substatus: 'Drafting missing sections…'
         });
         run.phases.push(step);
-        if (hooks && typeof hooks.onStep === 'function') hooks.onStep(step);
+        if (hooks && typeof hooks.onStep === 'function') {
+            try { hooks.onStep(step); } catch (err) { console.warn('[Blueprint] onStep hook error in gap repair:', err); }
+        }
         core.saveRun(run);
-        if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
+        if (hooks && typeof hooks.onRender === 'function') {
+            try { hooks.onRender(); } catch (err) { console.warn('[Blueprint] onRender hook error in gap repair:', err); }
+        }
 
         const missingText = (gaps && gaps.missing && gaps.missing.length)
             ? `- Missing sections: ${gaps.missing.join(', ')}`
@@ -1019,12 +1278,16 @@
         }, hooks);
 
         core.writeFile(targetPath, step.text, { runId: run.id, revised: true });
-        if (hooks && typeof hooks.onFileWritten === 'function') hooks.onFileWritten(targetPath);
+        if (hooks && typeof hooks.onFileWritten === 'function') {
+            try { hooks.onFileWritten(targetPath); } catch (_) {}
+        }
 
         const review = reviewDocument(step.text, (gaps && gaps.requiredSections) || []);
         step.summary = review.ok ? 'All gaps repaired successfully' : `${review.missing.length} sections still missing`;
         core.saveRun(run);
-        if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
+        if (hooks && typeof hooks.onRender === 'function') {
+            try { hooks.onRender(); } catch (err) { console.warn('[Blueprint] onRender hook error in gap repair:', err); }
+        }
         return { path: targetPath, review };
     }
 
@@ -1045,6 +1308,7 @@
         promptPreview,
         bounded,
         formatCompactionPrompt,
+        stripCompactionFromPrompt,
         injectCompactionIntoPrompt,
         compressContext
     });

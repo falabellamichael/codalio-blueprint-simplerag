@@ -59,6 +59,8 @@ function createHarness() {
 
     const coreSrc = fs.readFileSync(path.join(SRC, 'controller-core.js'), 'utf8');
     vm.runInContext(coreSrc, context, { filename: 'controller-core.js' });
+    // Make core mutable in test harness so tests can stub streamModelTurn
+    windowStub.__codalioBlueprintCore = Object.assign({}, windowStub.__codalioBlueprintCore);
 
     const skillsSrc = fs.readFileSync(path.join(SRC, 'skills.js'), 'utf8');
     vm.runInContext(skillsSrc, context, { filename: 'skills.js' });
@@ -214,7 +216,119 @@ async function run() {
     assert.ok(compactChip, 'Composer quick bar contains /compact chip');
     console.log('✓ UI agent header and composer render compact controls');
 
-    console.log('\nAll Anti-gravity Context Compression tests PASSED successfully!\n');
+    // 6. Context Overflow Error Detection
+    assert.ok(core.isContextOverflowError(new Error('context length exceeded (4096 tokens max)')), 'Detects context length exceeded');
+    assert.ok(core.isContextOverflowError(new Error('prompt is too long for the context window')), 'Detects prompt too long');
+    assert.ok(core.isContextOverflowError(new Error('maximum context length is 8192')), 'Detects maximum context length');
+    assert.ok(core.isContextOverflowError(new Error('n_ctx limit exceeded')), 'Detects n_ctx overflow');
+    assert.ok(core.isContextOverflowError({ message: 'HTTP 400: context_length_exceeded' }), 'Detects 400 context_length_exceeded');
+    assert.ok(core.isContextOverflowError(new Error('token limit exceeded')), 'Detects token limit');
+    assert.ok(!core.isContextOverflowError(new Error('Failed to fetch from model server')), 'Rejects network error');
+    assert.ok(!core.isContextOverflowError(new Error('404 Not Found')), 'Rejects 404 error');
+    console.log('✓ core.isContextOverflowError accurately detects context exhaustion');
+
+    // 7. Compaction Stripping & Clean Prompt Refresh
+    const alreadyCompacted = agent.injectCompactionIntoPrompt('Do task A', compaction);
+    assert.ok(alreadyCompacted.startsWith('# Resuming from a compaction'), 'Starts with compaction');
+    const stripped = agent.stripCompactionFromPrompt(alreadyCompacted);
+    assert.equal(stripped, 'Do task A', 'Strips compaction block cleanly without leaving artifacts');
+    const refreshed = agent.injectCompactionIntoPrompt(alreadyCompacted, compaction);
+    const countOfHeaders = (refreshed.match(/# Resuming from a compaction/g) || []).length;
+    assert.equal(countOfHeaders, 1, 'Re-injecting compaction does not produce duplicate nested compaction blocks');
+    console.log('✓ agent.stripCompactionFromPrompt prevents nested compaction bloat');
+
+    // 8. Multi-Compaction Request Inheritance
+    const messagesWithCompaction = [
+        { id: 'c1', role: 'compaction', compaction: compaction },
+        { id: 'm4', role: 'user', text: '4. Add automated unit tests for SQLite storage' },
+        { id: 'm5', role: 'assistant', text: 'Tests added.' }
+    ];
+    const secondCompaction = core.buildDeterministicCompaction({
+        messages: messagesWithCompaction,
+        run: runObj
+    });
+    assert.equal(secondCompaction.userRequests.length, 4, 'Inherits previous 3 requests and adds the 4th request');
+    assert.equal(secondCompaction.userRequests[3], '4. Add automated unit tests for SQLite storage');
+    console.log('✓ Sequential compactions accumulate and preserve all user requests across cycles');
+
+    // 9. Automatic Compaction & Turn Recovery (No Agent Restart Required)
+    let callCount = 0;
+    let autoCompactTriggered = false;
+    core.streamModelTurn = async (options) => {
+        callCount++;
+        if (callCount === 1) {
+            // First call runs out of context
+            const err = new Error('Model error: maximum context length exceeded (prompt is too long)');
+            err.code = 'context_length_exceeded';
+            throw err;
+        }
+        // Second call succeeds after auto-compaction
+        assert.ok(options.message.includes('# Resuming from a compaction'), 'Retried prompt includes auto-compaction');
+        return { text: 'Turn completed smoothly after automatic compaction.', finishReason: 'stop' };
+    };
+
+    const testStep = agent.makeStep({ label: 'Test Step', status: 'pending' });
+    let compactionReceived = null;
+    const recoveredStep = await agent.runModelStep(testStep, {
+        prompt: 'Very long conversation prompt that exceeded endpoint context window',
+        maxOutputTokens: 2048,
+        temperature: 0.3
+    }, {
+        onAutoCompact: async (event) => {
+            autoCompactTriggered = true;
+            assert.equal(event.reason, 'context-overflow', 'Reason is context-overflow');
+            compactionReceived = core.buildDeterministicCompaction({
+                messages: mockMessages,
+                run: runObj
+            });
+            return compactionReceived;
+        }
+    });
+
+    assert.equal(callCount, 2, 'streamModelTurn was called twice (initial attempt + auto-retry)');
+    assert.ok(autoCompactTriggered, 'onAutoCompact was automatically invoked');
+    assert.equal(recoveredStep.status, 'done', 'Step recovered and finished with status done');
+    assert.equal(recoveredStep.text, 'Turn completed smoothly after automatic compaction.');
+    console.log('✓ agent.runModelStep automatically compacts context on overflow and recovers without restart');
+
+    // 10. Output Limit Automatic Continuation & Seam Stitching
+    const noticeString = '[⚠️ Output limit reached. The response used the maximum output tokens allowed for this request and may be incomplete.]';
+    assert.ok(core.hasOutputLimitNotice(noticeString), 'Detects output limit notice');
+    assert.ok(core.hasOutputLimitNotice(`Some output\n\n${noticeString}`), 'Detects embedded output limit notice');
+    assert.equal(core.stripOutputLimitNotice(`Some output\n\n${noticeString}`), 'Some output', 'Strips output limit notice cleanly');
+
+    let outputContinuationCalls = 0;
+    core.streamModelTurn = async (options) => {
+        outputContinuationCalls++;
+        if (outputContinuationCalls === 1) {
+            return {
+                text: `## 1. Examined\n- file_a.js\n- file_b.js\n\n## 2. Capabilities\n- Authentic\n\n${noticeString}`,
+                finishReason: 'length'
+            };
+        }
+        assert.ok(options.message.includes('# CONTINUATION REQUIRED (OUTPUT LIMIT REACHED)'), 'Continuation prompt generated');
+        return {
+            text: 'ation via tokens.\n\n## 3. Flows\n- Complete end to end flow.',
+            finishReason: 'stop'
+        };
+    };
+
+    const outputStep = agent.makeStep({ label: 'Inventory Step', status: 'pending' });
+    const finishedContinuationStep = await agent.runModelStep(outputStep, {
+        prompt: 'Inventory the codebase attached below.',
+        maxOutputTokens: 4096,
+        temperature: 0.2
+    }, {});
+
+    assert.equal(outputContinuationCalls, 2, 'Continuation triggered second turn automatically');
+    assert.equal(finishedContinuationStep.status, 'done', 'Continuation finished with status done');
+    assert.equal(finishedContinuationStep.finishReason, 'stop', 'Final finish reason converted to stop');
+    assert.ok(!finishedContinuationStep.text.includes(noticeString), 'Output limit notice stripped completely');
+    assert.ok(finishedContinuationStep.text.includes('Authentication via tokens.'), 'Stitched text merges mid-word or overlap smoothly');
+    assert.ok(finishedContinuationStep.text.includes('## 3. Flows'), 'Includes second pass content');
+    console.log('✓ agent.runModelStep automatically continues when hitting output token limit and stitches output seamlessly');
+
+    console.log('\nAll Anti-gravity Context Compression and Auto-continuation tests PASSED successfully!\n');
 }
 
 run().catch(err => {
